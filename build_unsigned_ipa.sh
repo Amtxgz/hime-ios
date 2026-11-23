@@ -73,7 +73,7 @@ build_once() {
     echo "==> 追加链接器参数: $extra_ld"
   fi
 
-  echo "==> 开始编译（日志: $log）"
+  echo "==> 开始编译（日志: ${log}）"
   set +e
   xcodebuild "${args[@]}" build 2>&1 | tee "$log"
   local rc=${PIPESTATUS[0]}
@@ -85,11 +85,18 @@ if build_once "" "$BUILD/xcodebuild.log"; then
   echo "==> 编译成功"
 else
   echo
-  echo "!! 首次编译失败，清理产物后用 -ld_classic（Xcode 15 旧链接器）重试"
+  echo "!! 首次编译失败，下面是关键错误行："
+  grep -nE "error:|fatal error:|Undefined symbols|The following build commands failed" "$BUILD/xcodebuild.log" | head -40 || true
+  echo "--- 日志尾部 80 行 ---"
+  tail -n 80 "$BUILD/xcodebuild.log" || true
+  echo
+  echo "!! 清理产物后用 -ld_classic（Xcode 15 旧链接器）重试"
   echo
   rm -rf "$BUILD/DerivedData"
   build_once "-ld_classic" "$BUILD/xcodebuild-ldclassic.log" || {
-    echo "错误：两次编译均失败，请把 build/*.log 上传回来分析" >&2
+    echo "错误：两次编译均失败，下面是第二次的关键错误行：" >&2
+    grep -nE "error:|fatal error:|Undefined symbols|The following build commands failed" "$BUILD/xcodebuild-ldclassic.log" | head -40 >&2 || true
+    tail -n 120 "$BUILD/xcodebuild-ldclassic.log" >&2 || true
     exit 1
   }
   echo "==> 编译成功（-ld_classic）"
