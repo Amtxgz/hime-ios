@@ -1,0 +1,154 @@
+name: Build unsigned IPA
+
+# 不需要 Unity 授权：Xcode 工程已由 Unity（Windows 端）导出完毕，
+# 这里只做「解压 → Xcode 编译 arm64 → 打包未签名 IPA」。
+#
+# 使用前提（详见 README.md）：
+#   1) 仓库已创建
+#   2) 已把 HimeAlpha-iOS-XcodeProject.zip 作为 Release 资产上传
+#   3) 本文件位于 .github/workflows/build-ipa.yml
+#
+# 然后到 Actions 页面点 "Run workflow" 即可。
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "工程 zip 所在的 Release 标签（例如 v1）"
+        required: true
+        default: "v1"
+      asset_name:
+        description: "Release 资产文件名"
+        required: true
+        default: "HimeAlpha-iOS-XcodeProject.zip"
+      ipa_name:
+        description: "输出 IPA 文件名"
+        required: false
+        default: "HimeAlpha_1.05_unsigned.ipa"
+      project_zip_url:
+        description: "（可选）工程 zip 的任意公网直链，填写后忽略 Release 下载"
+        required: false
+        default: ""
+      expected_sha256:
+        description: "（可选）工程 zip 的 sha256，用于校验上传完整性"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # 注意：macos-14 已于 2026-11-02 退役，现在只能选 macos-15（Xcode 16.x）
+    #       macos-latest 目前指向 macos-26 + Xcode 26，最低部署目标更高，对 Unity 2021.3 不友好
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 下载 Xcode 工程
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ inputs.asset_name }}
+          ZIP_URL: ${{ inputs.project_zip_url }}
+          EXPECT_SHA: ${{ inputs.expected_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ZIP_URL:-}" ]; then
+            echo "从直链下载：$ZIP_URL"
+            curl -L --retry 5 --retry-delay 5 --retry-all-errors -o "$ASSET" "$ZIP_URL"
+          else
+            echo "从 Release 下载：$TAG / $ASSET"
+            gh release download "$TAG" --pattern "$ASSET" --dir . --clobber
+          fi
+          ls -lh "$ASSET"
+          ACTUAL="$(shasum -a 256 "$ASSET" | cut -d' ' -f1)"
+          echo "sha256: $ACTUAL"
+          if [ -n "${EXPECT_SHA:-}" ] && [ "$ACTUAL" != "$EXPECT_SHA" ]; then
+            echo "错误：sha256 不匹配，上传的资产已损坏或不完整" >&2
+            echo "  期望: $EXPECT_SHA" >&2
+            echo "  实际: $ACTUAL" >&2
+            exit 1
+          fi
+
+      - name: 解压工程
+        env:
+          ASSET: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p workspace
+          unzip -q "$ASSET" -d workspace
+          rm -f "$ASSET"   # 解压后立刻删掉 zip，给 runner 腾出 ~500MB
+          echo "--- 顶层内容 ---"
+          ls workspace | head -20
+          test -d workspace/Unity-iPhone.xcodeproj
+          test -f workspace/Libraries/libil2cpp.a
+          test -f workspace/Libraries/libiPhone-lib.a
+          test -d workspace/Classes/Native
+          echo "--- 体积 ---"
+          du -sh workspace workspace/Data workspace/Libraries workspace/Classes 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: 选择 Xcode
+        run: |
+          set -euo pipefail
+          # 优先 16.x（macos-15 自带），其次 15.x；都找不到就用镜像默认的
+          PICKED=""
+          for v in 16.4 16.3 16.2 16.1 16.0 15.4 15.3 15.2 15.1 15.0; do
+            if [ -d "/Applications/Xcode_${v}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${v}.app"
+              PICKED="$v"
+              echo "已选择 Xcode $v"
+              break
+            fi
+          done
+          [ -n "$PICKED" ] || echo "使用镜像默认 Xcode"
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: 编译并打包未签名 IPA
+        env:
+          IPA_NAME: ${{ inputs.ipa_name }}
+        run: |
+          set -euo pipefail
+          test -f build_unsigned_ipa.sh || { echo "错误：仓库根目录缺少 build_unsigned_ipa.sh" >&2; exit 1; }
+          cp build_unsigned_ipa.sh workspace/build_unsigned_ipa.sh
+          chmod +x workspace/build_unsigned_ipa.sh
+          cd workspace
+          echo "--- 构建前磁盘 ---"
+          df -h / | tail -1
+          ./build_unsigned_ipa.sh
+
+      - name: 汇总产物信息
+        if: success()
+        run: |
+          set -euo pipefail
+          ls -lh workspace/dist/
+          IPA="$(ls workspace/dist/*.ipa | head -1)"
+          echo "IPA: $IPA"
+          echo "大小: $(du -h "$IPA" | cut -f1)"
+          echo "sha256: $(shasum -a 256 "$IPA" | cut -d' ' -f1)"
+          unzip -l "$IPA" | head -15
+
+      - name: 上传 IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: workspace/dist/*.ipa
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            workspace/build/*.log
+          if-no-files-found: ignore
+          retention-days: 7
